@@ -126,10 +126,16 @@ Run on both a grayscale and a color device to exercise both blit paths.
 
 **Input**
 
-- [ ] Touch: tapping a button activates it (touch maps physical→logical via the
-      scale-to-fit offset + displayed size).
-- [ ] Hardware keys: D-pad moves focus, OK activates, Back/Menu behave.
-- [ ] Page-turn keys (Prev/Next) map to left/right.
+- [x] Touch maps physical→logical correctly through the `fit` offset + displayed
+      size. Verified on the Era Color by tapping the four corners + center of
+      the app area: every sample landed exactly on the inverse-mapping formula
+      (offset +2, scale 1260→375 / 1680→500), edge-to-edge on both axes. Touch
+      is the primary interaction — PocketBook devices have no D-pad/OK.
+      *(Era Color)*
+- [x] Page-turn keys (Prev/Next) map to left/right and are delivered in-app
+      (verified on the Era Color: Prev → LEFT `0x80`, Next → RIGHT `0x20`).
+      Menu is also delivered (as START) but the firmware handles it globally
+      too; Power never reaches the app (firmware-handled suspend). *(Era Color)*
 
 **E-ink refresh**
 
