@@ -169,7 +169,6 @@ fn run(iv: &'static inkview::bindings::Inkview, rx: mpsc::Receiver<Event>) -> Re
             &mut screen,
             &session.geo,
             true,
-            false,
         )?;
 
         let mut last_tick = Instant::now();
@@ -185,7 +184,6 @@ fn run(iv: &'static inkview::bindings::Inkview, rx: mpsc::Receiver<Event>) -> Re
             let deadline = last_tick + Duration::from_millis(TICK_MS);
             let mut quit = false;
             let mut full = false;
-            let mut resume_tick = false;
             let was_hidden = hidden;
             loop {
                 let now = Instant::now();
@@ -215,17 +213,22 @@ fn run(iv: &'static inkview::bindings::Inkview, rx: mpsc::Receiver<Event>) -> Re
                 return Ok(());
             }
 
-            // Resume from background: re-acquire the framebuffer (the
-            // orientation path does the same) and force one clean repaint over
-            // the displayed region. NOTE: on the Era Color the panel still
-            // ignores the spinner's incremental updates after a
-            // background/foreground cycle until input — the re-priming the
-            // panel needs there is still under investigation.
+            // Resume from background: reboot the guest session, exactly like
+            // the orientation path does. On the Era Color a task-list resume
+            // leaves the panel dropping the app's incremental updates, and the
+            // state that causes it lives in the running guest/surface — not the
+            // render layer (re-acquiring the framebuffer, SetOrientation,
+            // full/partial updates, a settle delay, and even a fresh
+            // framebuffer pipeline + refresh policy with the guest kept alive
+            // all fail). A fresh session — re-evaluating the bundle into a new
+            // guest and doing a clean first-paint full_update — renders
+            // normally. This resets in-app state (the same trade-off rotation
+            // already makes); a state-preserving fix would require tracking
+            // down the framework state that goes stale across a background gap.
             if was_hidden && !hidden {
+                log::info!("pocketbook: resumed from background → rebooting session");
                 screen = inkview::screen::Screen::new(iv);
-                full = true;
-                resume_tick = true;
-                log::info!("pocketbook: resumed from background → re-acquired framebuffer");
+                continue 'session;
             }
 
             // While hidden the launcher owns the panel: don't advance the
@@ -275,7 +278,6 @@ fn run(iv: &'static inkview::bindings::Inkview, rx: mpsc::Receiver<Event>) -> Re
                 &mut screen,
                 &session.geo,
                 full,
-                resume_tick,
             )?;
         }
     }
@@ -420,7 +422,6 @@ fn tick(
     screen: &mut inkview::screen::Screen,
     geo: &Geometry,
     full: bool,
-    resume: bool,
 ) -> Result<()> {
     let (buttons, analog, touches) = input.snapshot();
     guest.frame_with_touches(buttons, analog, &touches)?;
@@ -439,22 +440,10 @@ fn tick(
 
     if full {
         // Full panel redraw: the retained buffer is always the complete current
-        // frame, so re-blit it. First paint / orientation change flash the panel
-        // (full_update); a resume from background does a high-quality partial
-        // over the displayed region instead — a full_update there leaves the
-        // panel ignoring incremental updates until input (see refresh.resume).
+        // frame, so re-blit it and flash the panel (first paint / orientation
+        // change / resume-from-background reboot).
         fb.blit_all(screen, geo);
-        if resume {
-            refresh.resume(
-                screen,
-                geo.ox as i32,
-                geo.oy as i32,
-                geo.disp_w as u32,
-                geo.disp_h as u32,
-            );
-        } else {
-            refresh.full(screen);
-        }
+        refresh.full(screen);
         fb.advance_full();
     } else if !dirty.is_empty() {
         fb.blit_dirty(screen, &dirty, geo);

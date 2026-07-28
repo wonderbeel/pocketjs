@@ -6,10 +6,12 @@ The PocketJS UI runtime on **PocketBook e-readers**, rendered through the
 It reuses the backend-agnostic `ui` surface (`pocket-ui-surface`) and the
 core's software rasterizer unchanged, then:
 
-- rasterizes the DrawList **incrementally** to a retained RGBA8 buffer at
-  `480×272 @2x` = 960×544 (`pocketjs_core::raster::render_scaled_incremental`
-  with a core `DamageTracker`), matching the `pocketbook` target profile in
-  `contracts/spec/platforms.ts` — an idle frame costs zero raster work;
+- rasterizes the DrawList **incrementally** to a retained RGBA8 buffer at the
+  target profile's logical viewport × raster density
+  (`pocketjs_core::raster::render_scaled_incremental` with a core
+  `DamageTracker`) — e.g. `pocketbook` is `375×500 @4x` = 1500×2000,
+  `pocketbook-compat` is `480×272 @2x` = 960×544 (see
+  `contracts/spec/platforms.ts`). An idle frame costs zero raster work;
 - pixel-diffs 16×16 tiles **inside the damage regions** and blits the changed
   pixels as `RGB24` (`framebuffer.rs`). The DrawList damage bounds the raster
   and the scan; the pixel diff trims the e-ink refresh to tiles that actually
@@ -25,8 +27,10 @@ core's software rasterizer unchanged, then:
   a second thread owning the `Screen` and the fixed-cadence tick/render loop
   (`main.rs`, the `inkview-slint` demo model).
 
-The 960×544 render is integer-fit centered on the actual panel (which varies by
-model), so the host works across devices without per-model configuration.
+The render buffer is placed on the actual panel (which varies by model)
+according to the target's presentation — `pocketbook` uses `fit` (scaled to fill
+a ~3:4 panel), `pocketbook-compat` uses integer-fit centering — so the host
+works across devices without per-model configuration.
 
 See **`docs/IMPLEMENTATION.md`** in this directory for the full
 design and the ground-truth API notes.
@@ -134,19 +138,28 @@ Run on both a grayscale and a color device to exercise both blit paths.
 - [x] During animation the panel keeps up (dynamic updates), then does a clean
       partial update when it settles (~200 ms quiet). *(Verse)*
 - [ ] No persistent ghosting after a few seconds idle (periodic cleanup works).
-- [ ] Returning from background does one clean full redraw and animations
-      resume immediately (no frozen screen until the first key/touch). Resume
-      is signaled by `Show`/`Foreground`/`Repaint` (all force a full redraw);
-      `Hide`/`Background` pause panel driving while the launcher owns it.
+- [x] Returning from background resumes cleanly. Resume is signaled by
+      `Show`/`Foreground`/`Repaint`; `Hide`/`Background` pause guest ticking and
+      panel driving while the launcher owns the panel. On resume the host
+      **reboots the guest session** (re-acquire the framebuffer, re-eval the
+      bundle, clean first-paint `full_update`) — the same mechanism rotation
+      uses. A task-list resume on the Era Color otherwise leaves the panel
+      dropping incremental updates until input, and the stale state lives in the
+      running guest: re-acquiring the framebuffer, `SetOrientation`, full /
+      partial updates, a settle delay, and even a fresh framebuffer pipeline +
+      refresh policy with the guest kept alive all fail to clear it. Trade-off:
+      in-app state resets on resume, same as rotation. *(Era Color)*
 
 **Orientation**
 
-- [ ] Rotating the device re-renders the app at the swapped logical viewport
+- [x] Rotating the device re-renders the app at the swapped logical viewport
       (portrait ↔ landscape). inkview's safe `Event` enum drops
-      `EVT_ORIENTATION`, so the host polls `Screen::orientation()` each visible
-      tick and restarts the guest session when it changes — verify the restart
-      log line (`pocketbook: orientation changed → restarting guest`) and that
-      the re-render is clean.
+      `EVT_ORIENTATION`, and the firmware only auto-applies portrait↔portrait-180
+      flips to `GetOrientation`, so the host polls the physical G-sensor
+      (`GetGSensorOrientation`, debounced ~200 ms), calls `SetOrientation`,
+      re-acquires the framebuffer (its layout swaps for landscape), and restarts
+      the guest session — verify the `pocketbook: rotating … (gsensor N stable)`
+      log line and that the re-render is clean. *(Era Color)*
 
 ### Validated on hardware
 
@@ -158,7 +171,9 @@ Run on both a grayscale and a color device to exercise both blit paths.
   no longer re-rasterizes and re-scans the whole 960×544 frame every 33 ms.
   Input (touch / hardware keys), idle ghosting, and background-return still
   need a hands-on pass.
-- **Era Color / Kaleido 3** — not yet tested (color blit path unverified).
+- **PocketBook Era Color** (color, 1264×1680, Kaleido 3) — 2026-07-28. Boot,
+  color render, G-sensor rotation (portrait ↔ landscape), and background/resume
+  (session reboot) confirmed; the color blit path writes RGB directly.
 
 ### Logs
 
