@@ -134,7 +134,19 @@ Run on both a grayscale and a color device to exercise both blit paths.
 - [x] During animation the panel keeps up (dynamic updates), then does a clean
       partial update when it settles (~200 ms quiet). *(Verse)*
 - [ ] No persistent ghosting after a few seconds idle (periodic cleanup works).
-- [ ] Returning from background (`Show`) does one clean full redraw.
+- [ ] Returning from background does one clean full redraw and animations
+      resume immediately (no frozen screen until the first key/touch). Resume
+      is signaled by `Show`/`Foreground`/`Repaint` (all force a full redraw);
+      `Hide`/`Background` pause panel driving while the launcher owns it.
+
+**Orientation**
+
+- [ ] Rotating the device re-renders the app at the swapped logical viewport
+      (portrait ↔ landscape). inkview's safe `Event` enum drops
+      `EVT_ORIENTATION`, so the host polls `Screen::orientation()` each visible
+      tick and restarts the guest session when it changes — verify the restart
+      log line (`pocketbook: orientation changed → restarting guest`) and that
+      the re-render is clean.
 
 ### Validated on hardware
 

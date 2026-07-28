@@ -19,32 +19,91 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use inkview::screen::ScreenOrientation;
 use inkview::Event;
 use pocket_mod::Guest;
 use pocket_ui_surface::UiSurface;
 
 use framebuffer::DirtyRect;
 
-/// Host platform-contract identity. Must match `pocketbook.hostAbi` in
-/// contracts/spec/platforms.ts, or plan-built bundles refuse this host
-/// (framework/src/host.ts::assertNativeHostContract).
-const HOST_ID: &str = "pocketbook";
-const HOST_ABI: u32 = 5;
+/// Host platform-contract identity, baked from the resolved build plan by
+/// build.rs (POCKETJS_TARGET). Must equal the bundle's target id or plan-built
+/// bundles refuse this host (framework/src/host.ts::assertNativeHostContract) —
+/// so one source tree is rebuilt per pocketbook-* target, not one binary for
+/// the whole family.
+const HOST_ID: &str = env!("POCKETJS_TARGET");
+const HOST_ABI_STR: &str = env!("POCKETJS_HOST_ABI");
 
 /// Logical tick cadence. E-ink doesn't need 60 fps; ~30 fps keeps animations
 /// smooth while sparing CPU and battery.
 const TICK_MS: u64 = 33;
 
-/// Logical viewport the pocketbook target profile bakes bundles for
-/// (contracts/spec/platforms.ts). Must match the bundle: the framework lays
-/// the app out for this size, so the host presents exactly it.
-const LOGICAL_W: u32 = 480;
-const LOGICAL_H: u32 = 272;
-/// Raster density the target profile bakes font atlases/images at; the host
-/// must render at the same density for crisp output. 480×272 also stays
-/// ≤511 px/axis, keeping touch coordinates inside the 9-bit wire format
-/// (framework/src/touch.ts).
-const DENSITY: u32 = 2;
+/// How many consecutive ticks the physical G-sensor must hold a new orientation
+/// before we rotate (~200 ms at the 33 ms cadence). A physical turn passes
+/// through transient intermediate readings (confirmed on the Era Color:
+/// portrait→landscape→portrait flips through GSensor 2/1 en route); debouncing
+/// avoids flapping the guest session through them.
+const ORIENT_DEBOUNCE_TICKS: u32 = 6;
+
+/// The authored logical viewport + raster density the target profile bakes
+/// bundles for (contracts/spec/platforms.ts), baked by build.rs. Must match the
+/// bundle: the framework lays the app out for this size, so the host presents
+/// exactly it. Both pocketbook logicals stay ≤511 px/axis, keeping touch
+/// coordinates inside the 9-bit wire format (framework/src/touch.ts).
+const LOGICAL_W_STR: &str = env!("POCKETJS_LOGICAL_WIDTH");
+const LOGICAL_H_STR: &str = env!("POCKETJS_LOGICAL_HEIGHT");
+const DENSITY_STR: &str = env!("POCKETJS_RASTER_DENSITY");
+/// Presentation the plan resolved: "fit" (default tier — scale to the panel up
+/// or down) or "integer-fit" (pocketbook-compat — blit-or-shrink, verbatim).
+const PRESENTATION: &str = env!("POCKETJS_PRESENTATION");
+
+/// Baked host identity + viewport, parsed once at startup.
+struct HostConfig {
+    host_abi: u32,
+    /// The logical viewport the app declared (its authored orientation).
+    logical_w: u32,
+    logical_h: u32,
+    density: u32,
+}
+
+impl HostConfig {
+    fn from_env() -> Self {
+        Self {
+            host_abi: parse_baked(HOST_ABI_STR, "POCKETJS_HOST_ABI"),
+            logical_w: parse_baked(LOGICAL_W_STR, "POCKETJS_LOGICAL_WIDTH"),
+            logical_h: parse_baked(LOGICAL_H_STR, "POCKETJS_LOGICAL_HEIGHT"),
+            density: parse_baked(DENSITY_STR, "POCKETJS_RASTER_DENSITY"),
+        }
+    }
+}
+
+fn parse_baked(value: &str, name: &str) -> u32 {
+    value
+        .parse::<u32>()
+        .unwrap_or_else(|_| panic!("baked {name} value {value:?} is not a u32"))
+}
+
+fn is_landscape(orientation: ScreenOrientation) -> bool {
+    matches!(
+        orientation,
+        ScreenOrientation::Landscape90Deg | ScreenOrientation::Landscape270Deg
+    )
+}
+
+/// inkview orientation raw int → `ScreenOrientation`. Mirrors inkview's private
+/// `ScreenOrientation::from_iv`: 0=Portrait0, 1=Landscape270, 2=Landscape90,
+/// 3=Portrait180. The physical G-sensor reading (`GetGSensorOrientation`), the
+/// app orientation (`GetOrientation`), and the `SetOrientation` argument all use
+/// this same encoding, so a G-sensor value can be fed straight to SetOrientation.
+fn orient_from_raw(raw: i32) -> ScreenOrientation {
+    match raw {
+        0 => ScreenOrientation::Portrait0Deg,
+        1 => ScreenOrientation::Landscape270Deg,
+        2 => ScreenOrientation::Landscape90Deg,
+        3 => ScreenOrientation::Portrait180Deg,
+        _ => ScreenOrientation::Portrait0Deg,
+    }
+}
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -85,15 +144,191 @@ fn run(iv: &'static inkview::bindings::Inkview, rx: mpsc::Receiver<Event>) -> Re
     }
 
     let mut screen = inkview::screen::Screen::new(iv);
-    let phys_w = screen.width();
-    let phys_h = screen.height();
+    let cfg = HostConfig::from_env();
 
-    let geo = Geometry::for_panel(phys_w, phys_h);
+    // Read the bundle once; it is re-evaluated on every orientation restart.
+    let pak = std::fs::read(pak_path()).with_context(|| format!("reading {}", pak_path()))?;
+    let bundle =
+        std::fs::read_to_string(js_path()).with_context(|| format!("reading {}", js_path()))?;
+
+    // One session per device orientation. Rotation is driven by the physical
+    // G-sensor (polled each visible tick, debounced), not by events — see the
+    // poll below. `orientation` lives outside the session loop so a rotation
+    // can update it and fall through into a fresh boot.
+    let mut orientation = screen.orientation();
+    'session: loop {
+        let mut session = boot(&cfg, &screen, orientation, &pak, &bundle)?;
+
+        // First paint: one frame + full-update so the screen starts clean.
+        tick(
+            &session.guest,
+            &session.surface,
+            &mut session.fb,
+            &mut session.refresh,
+            &mut session.input,
+            &mut screen,
+            &session.geo,
+            true,
+            false,
+        )?;
+
+        let mut last_tick = Instant::now();
+        // Visibility: the app starts in the foreground. Hide/Background set
+        // this; Show/Foreground/Repaint clear it (input.rs::Outcome).
+        let mut hidden = false;
+        // Orientation debounce: how many consecutive ticks the current
+        // G-sensor reading has held, so we only rotate once it is stable.
+        let mut pending_orient: Option<i32> = None;
+        let mut pending_count: u32 = 0;
+        loop {
+            // Pull events until the tick deadline, then drain any burst.
+            let deadline = last_tick + Duration::from_millis(TICK_MS);
+            let mut quit = false;
+            let mut full = false;
+            let mut resume_tick = false;
+            let was_hidden = hidden;
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match rx.recv_timeout(deadline - now) {
+                    Ok(ev) => {
+                        if apply_outcome(session.input.on_event(ev), &mut hidden, &mut full) {
+                            quit = true;
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        quit = true;
+                        break;
+                    }
+                }
+            }
+            while let Ok(ev) = rx.try_recv() {
+                if apply_outcome(session.input.on_event(ev), &mut hidden, &mut full) {
+                    quit = true;
+                }
+            }
+            if quit {
+                return Ok(());
+            }
+
+            // Resume from background: re-acquire the framebuffer (the
+            // orientation path does the same) and force one clean repaint over
+            // the displayed region. NOTE: on the Era Color the panel still
+            // ignores the spinner's incremental updates after a
+            // background/foreground cycle until input — the re-priming the
+            // panel needs there is still under investigation.
+            if was_hidden && !hidden {
+                screen = inkview::screen::Screen::new(iv);
+                full = true;
+                resume_tick = true;
+                log::info!("pocketbook: resumed from background → re-acquired framebuffer");
+            }
+
+            // While hidden the launcher owns the panel: don't advance the
+            // guest or drive the e-ink (it would fight the launcher's own
+            // updates and burn battery). Keep waking on the tick cadence so a
+            // resume event — or a rotation — is still noticed promptly.
+            if hidden {
+                last_tick = Instant::now();
+                continue;
+            }
+
+            // Rotation: drive from the PHYSICAL G-sensor, not GetOrientation.
+            // The firmware only auto-applies portrait↔portrait-180 flips to
+            // GetOrientation; landscape (GSensor 1/2) is reported by the sensor
+            // but never applied unless the app calls SetOrientation itself
+            // (confirmed on the Era Color: GSensor reaches 1/2 while
+            // GetOrientation stays 0/3). Debounce the sensor so a turn doesn't
+            // flap the session through transient intermediate readings.
+            let gsensor = unsafe { iv.GetGSensorOrientation() };
+            if Some(gsensor) == pending_orient {
+                pending_count += 1;
+            } else {
+                pending_orient = Some(gsensor);
+                pending_count = 1;
+            }
+            if pending_count >= ORIENT_DEBOUNCE_TICKS && orient_from_raw(gsensor) != orientation {
+                log::info!(
+                    "pocketbook: rotating {orientation} → {} (gsensor {gsensor} stable)",
+                    orient_from_raw(gsensor)
+                );
+                // Apply the rotation to the panel, then re-acquire the
+                // framebuffer (its layout may swap for landscape) and boot a
+                // fresh session at the orientation-matching logical viewport.
+                unsafe { iv.SetOrientation(gsensor) };
+                screen = inkview::screen::Screen::new(iv);
+                orientation = orient_from_raw(gsensor);
+                continue 'session;
+            }
+
+            last_tick = Instant::now();
+            tick(
+                &session.guest,
+                &session.surface,
+                &mut session.fb,
+                &mut session.refresh,
+                &mut session.input,
+                &mut screen,
+                &session.geo,
+                full,
+                resume_tick,
+            )?;
+        }
+    }
+}
+
+/// Apply one event's outcome to the loop's visibility/repaint flags. Returns
+/// `true` when the app should quit. Kept as a free function (not a closure)
+/// so the mutable borrows of `hidden`/`full` don't overlap the loop's direct
+/// `quit = true` on channel disconnect.
+fn apply_outcome(outcome: input::Outcome, hidden: &mut bool, full: &mut bool) -> bool {
+    match outcome {
+        input::Outcome::Quit => true,
+        input::Outcome::Show => {
+            *hidden = false;
+            *full = true;
+            false
+        }
+        input::Outcome::Hide => {
+            *hidden = true;
+            false
+        }
+        input::Outcome::Continue => false,
+    }
+}
+
+/// A running guest bound to one device orientation: the geometry chosen for the
+/// panel + orientation, and the surface/guest/render state laid out for it.
+struct Session {
+    geo: Geometry,
+    surface: UiSurface,
+    guest: Guest,
+    fb: framebuffer::FramebufferPipeline,
+    refresh: refresh::Refresh,
+    input: input::Input,
+}
+
+/// Boot the guest for one orientation: pick the orientation-matching logical
+/// viewport, build the geometry, and run the bundle exactly like uihost
+/// (feed pak, mount ui, eval bundle).
+fn boot(
+    cfg: &HostConfig,
+    screen: &inkview::screen::Screen,
+    orientation: ScreenOrientation,
+    pak: &[u8],
+    bundle: &str,
+) -> Result<Session> {
+    let geo = session_geometry(cfg, screen, orientation);
     log::info!(
-        "pocketbook: panel {phys_w}x{phys_h}, logical {}x{} @{}x, render {}x{} → disp {}x{} +({},{})",
+        "pocketbook: orientation {orientation}, logical {}x{} @{}x ({}), render {}x{} → disp {}x{} +({},{})",
         geo.logical_w,
         geo.logical_h,
         geo.density,
+        PRESENTATION,
         geo.render_w,
         geo.render_h,
         geo.disp_w,
@@ -102,27 +337,22 @@ fn run(iv: &'static inkview::bindings::Inkview, rx: mpsc::Receiver<Event>) -> Re
         geo.oy
     );
 
-    // Boot the guest exactly like uihost: feed pak, mount ui, eval bundle.
-    let pak = std::fs::read(pak_path()).with_context(|| format!("reading {}", pak_path()))?;
-    let bundle =
-        std::fs::read_to_string(js_path()).with_context(|| format!("reading {}", js_path()))?;
-
     let surface =
         UiSurface::new_with_density((geo.logical_w as f32, geo.logical_h as f32), geo.density);
-    surface.set_identity(HOST_ID, HOST_ABI);
-    surface.feed_pak(&pak);
+    surface.set_identity(HOST_ID, cfg.host_abi);
+    surface.feed_pak(pak);
 
     let guest = Guest::new()?;
     surface.mount(&guest)?;
-    guest.eval("app", &bundle)?;
+    guest.eval("app", bundle)?;
     anyhow::ensure!(
         guest.has_frame(),
         "bundle installed no frame() — is this a PocketJS app?"
     );
 
-    let mut fb = framebuffer::FramebufferPipeline::new(geo.render_w, geo.render_h, geo.density);
-    let mut refresh = refresh::Refresh::new();
-    let mut input = input::Input::new(
+    let fb = framebuffer::FramebufferPipeline::new(geo.render_w, geo.render_h, geo.density);
+    let refresh = refresh::Refresh::new();
+    let input = input::Input::new(
         geo.ox as i32,
         geo.oy as i32,
         geo.logical_w as u32,
@@ -130,70 +360,52 @@ fn run(iv: &'static inkview::bindings::Inkview, rx: mpsc::Receiver<Event>) -> Re
         geo.disp_w as u32,
         geo.disp_h as u32,
     );
+    Ok(Session {
+        geo,
+        surface,
+        guest,
+        fb,
+        refresh,
+        input,
+    })
+}
 
-    // First paint: render one frame and full-update so the screen starts clean.
-    tick(
-        &guest,
-        &surface,
-        &mut fb,
-        &mut refresh,
-        &mut input,
-        &mut screen,
-        &geo,
-        true,
-    )?;
-
-    let mut last_tick = Instant::now();
-    loop {
-        // Pull events until the tick deadline, then drain any burst.
-        let deadline = last_tick + Duration::from_millis(TICK_MS);
-        let mut quit = false;
-        let mut full = false;
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            match rx.recv_timeout(deadline - now) {
-                Ok(ev) => match input.on_event(ev) {
-                    input::Outcome::Quit => {
-                        quit = true;
-                        break;
-                    }
-                    input::Outcome::FullRedraw => full = true,
-                    input::Outcome::Continue => {}
-                },
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    quit = true;
-                    break;
-                }
-            }
-        }
-        while let Ok(ev) = rx.try_recv() {
-            match input.on_event(ev) {
-                input::Outcome::Quit => quit = true,
-                input::Outcome::FullRedraw => full = true,
-                input::Outcome::Continue => {}
-            }
-        }
-        if quit {
-            break;
-        }
-
-        last_tick = Instant::now();
-        tick(
-            &guest,
-            &surface,
-            &mut fb,
-            &mut refresh,
-            &mut input,
-            &mut screen,
-            &geo,
-            full,
-        )?;
-    }
-    Ok(())
+/// Pick the logical viewport matching the device orientation and compute the
+/// presentation geometry for the effective panel. The panel dims are derived
+/// from the framebuffer's short/long edges (via min/max, so it doesn't matter
+/// whether `Screen::width()/height()` already reflect the current orientation
+/// or stay orientation-independent native dims): portrait presents short×long,
+/// landscape long×short. The app authors one logical (its declared
+/// orientation); when the device is in the other orientation we present the
+/// swapped logical so the app still fills the panel (every pocketbook target
+/// offers both [w,h] and [h,w]).
+fn session_geometry(
+    cfg: &HostConfig,
+    screen: &inkview::screen::Screen,
+    orientation: ScreenOrientation,
+) -> Geometry {
+    let landscape = is_landscape(orientation);
+    let (a, b) = (screen.width(), screen.height());
+    let (short, long) = (a.min(b), a.max(b));
+    let (panel_w, panel_h) = if landscape {
+        (long, short)
+    } else {
+        (short, long)
+    };
+    let authored_landscape = cfg.logical_w > cfg.logical_h;
+    let (logical_w, logical_h) = if landscape != authored_landscape {
+        (cfg.logical_h, cfg.logical_w)
+    } else {
+        (cfg.logical_w, cfg.logical_h)
+    };
+    Geometry::for_panel(
+        panel_w,
+        panel_h,
+        logical_w as usize,
+        logical_h as usize,
+        cfg.density,
+        PRESENTATION,
+    )
 }
 
 /// One fixed-step frame: guest turn → core tick → draw → raster → gray → blit
@@ -208,6 +420,7 @@ fn tick(
     screen: &mut inkview::screen::Screen,
     geo: &Geometry,
     full: bool,
+    resume: bool,
 ) -> Result<()> {
     let (buttons, analog, touches) = input.snapshot();
     guest.frame_with_touches(buttons, analog, &touches)?;
@@ -225,11 +438,23 @@ fn tick(
     });
 
     if full {
-        // Full panel redraw (first paint / return from background): the
-        // retained buffer is always the complete current frame, so re-blit it
-        // and flash the panel once for a clean, ghost-free image.
+        // Full panel redraw: the retained buffer is always the complete current
+        // frame, so re-blit it. First paint / orientation change flash the panel
+        // (full_update); a resume from background does a high-quality partial
+        // over the displayed region instead — a full_update there leaves the
+        // panel ignoring incremental updates until input (see refresh.resume).
         fb.blit_all(screen, geo);
-        refresh.full(screen);
+        if resume {
+            refresh.resume(
+                screen,
+                geo.ox as i32,
+                geo.oy as i32,
+                geo.disp_w as u32,
+                geo.disp_h as u32,
+            );
+        } else {
+            refresh.full(screen);
+        }
         fb.advance_full();
     } else if !dirty.is_empty() {
         fb.blit_dirty(screen, &dirty, geo);
@@ -268,9 +493,9 @@ struct Geometry {
     density: u32,
     render_w: usize,
     render_h: usize,
-    /// Displayed width on the panel after scale-to-fit (≤ render_w).
+    /// Displayed width on the panel after presentation scaling.
     disp_w: usize,
-    /// Displayed height on the panel after scale-to-fit (≤ render_h).
+    /// Displayed height on the panel after presentation scaling.
     disp_h: usize,
     /// Horizontal centering offset on the panel.
     ox: usize,
@@ -279,42 +504,56 @@ struct Geometry {
 }
 
 impl Geometry {
-    /// Present the bundle's fixed 480×272 @2x surface (a 960×544 render) on
-    /// the actual panel. When the render fits, it is integer-centered. When it
-    /// doesn't (e.g. a 960-wide render on a 758-wide portrait panel like the
-    /// Verse), it is nearest-neighbor scaled down to fit and then centered.
-    /// The logical viewport and density are fixed to match the pocketbook
-    /// target profile (and stay ≤511/axis, so touch coordinates fit the 9-bit
-    /// wire format).
-    fn for_panel(phys_w: usize, phys_h: usize) -> Self {
-        let logical_w = LOGICAL_W as usize;
-        let logical_h = LOGICAL_H as usize;
-        let render_w = logical_w * DENSITY as usize;
-        let render_h = logical_h * DENSITY as usize;
+    /// Present the bundle's fixed logical surface (logical × density render)
+    /// on the actual panel, whose effective dimensions already reflect the
+    /// device orientation. Two presentations:
+    ///
+    /// - `fit` (default `pocketbook` tier): nearest-neighbor scale to fill as
+    ///   much of the panel as possible while preserving aspect — UP or DOWN.
+    ///   This recovers ~95–99% of every ~3:4 panel; the cost is a soft
+    ///   non-integer scale on panels whose size isn't close to the render.
+    /// - anything else (`integer-fit`, the `pocketbook-compat` tier): the
+    ///   legacy behavior verbatim — when the render fits it is blit 1:1 and
+    ///   centered; when it doesn't (e.g. a 960-wide render on a 758-wide
+    ///   portrait panel like the Verse) it is scaled DOWN to fit and centered.
+    ///
+    /// The logical viewport and density come from the plan and stay
+    /// ≤511/axis, so touch coordinates fit the 9-bit wire format.
+    fn for_panel(
+        panel_w: usize,
+        panel_h: usize,
+        logical_w: usize,
+        logical_h: usize,
+        density: u32,
+        presentation: &str,
+    ) -> Self {
+        let render_w = logical_w * density as usize;
+        let render_h = logical_h * density as usize;
 
-        let (disp_w, disp_h) = if render_w <= phys_w && render_h <= phys_h {
-            (render_w, render_h)
-        } else {
-            // Scale down to fit: pick the binding axis.
-            // Compare phys_w/render_w vs phys_h/render_h without floats:
-            //   phys_w * render_h < phys_h * render_w  →  width binds
-            if phys_w * render_h < phys_h * render_w {
-                let dw = phys_w;
-                let dh = (render_h * phys_w) / render_w;
-                (dw, dh.max(1))
+        // Scale to fit, picking the binding axis without floats:
+        //   panel_w * render_h < panel_h * render_w  →  width binds
+        let fit = |panel_w: usize, panel_h: usize| -> (usize, usize) {
+            if panel_w * render_h < panel_h * render_w {
+                (panel_w, (render_h * panel_w / render_w).max(1))
             } else {
-                let dh = phys_h;
-                let dw = (render_w * phys_h) / render_h;
-                (dw.max(1), dh)
+                ((render_w * panel_h / render_h).max(1), panel_h)
             }
         };
 
-        let ox = phys_w.saturating_sub(disp_w) / 2;
-        let oy = phys_h.saturating_sub(disp_h) / 2;
+        let (disp_w, disp_h) = if presentation == "fit" {
+            fit(panel_w, panel_h)
+        } else if render_w <= panel_w && render_h <= panel_h {
+            (render_w, render_h)
+        } else {
+            fit(panel_w, panel_h)
+        };
+
+        let ox = panel_w.saturating_sub(disp_w) / 2;
+        let oy = panel_h.saturating_sub(disp_h) / 2;
         Self {
             logical_w,
             logical_h,
-            density: DENSITY,
+            density,
             render_w,
             render_h,
             disp_w,
@@ -359,4 +598,68 @@ fn pak_path() -> String {
 
 fn js_path() -> String {
     std::env::var("POCKET_JS").unwrap_or_else(|_| "app.js".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_fills_the_plurality_panel_exactly() {
+        // Default tier: 375×500 @4x → a 1500×2000 render. On the plurality
+        // 1404×1872 InkPad panel the aspect matches exactly (both 3:4), so fit
+        // scales to fill the whole panel with no letterbox.
+        let geo = Geometry::for_panel(1404, 1872, 375, 500, 4, "fit");
+        assert_eq!((geo.render_w, geo.render_h), (1500, 2000));
+        assert_eq!((geo.disp_w, geo.disp_h), (1404, 1872));
+        assert_eq!((geo.ox, geo.oy), (0, 0));
+    }
+
+    #[test]
+    fn fit_scales_up_a_small_panel() {
+        // The discontinued Basic 3 (600×800, 3:4) is smaller than the render;
+        // fit scales UP to fill it (the legacy host only blit-or-shrank).
+        let geo = Geometry::for_panel(600, 800, 375, 500, 4, "fit");
+        assert_eq!((geo.disp_w, geo.disp_h), (600, 800));
+        assert_eq!((geo.ox, geo.oy), (0, 0));
+    }
+
+    #[test]
+    fn fit_letterboxes_a_non_matching_aspect() {
+        // The Verse (758×1024, ~0.740) is not exactly 3:4, so fit fills the
+        // width and leaves a thin vertical letterbox, centered.
+        let geo = Geometry::for_panel(758, 1024, 375, 500, 4, "fit");
+        assert_eq!(geo.disp_w, 758);
+        assert!(geo.disp_h <= 1024);
+        assert_eq!(geo.ox, 0);
+        assert_eq!(geo.oy, (1024 - geo.disp_h) / 2);
+    }
+
+    #[test]
+    fn compat_blits_when_the_render_fits() {
+        // pocketbook-compat: 480×272 @2x → 960×544 render, integer-fit. On a
+        // panel that fits it, the render is blit 1:1 and centered (verbatim
+        // legacy behavior — no scale-up).
+        let geo = Geometry::for_panel(1404, 1872, 480, 272, 2, "integer-fit");
+        assert_eq!((geo.disp_w, geo.disp_h), (960, 544));
+        assert_eq!((geo.ox, geo.oy), ((1404 - 960) / 2, (1872 - 544) / 2));
+    }
+
+    #[test]
+    fn compat_scales_down_an_oversized_render() {
+        // The legacy path on a portrait Verse panel: the 960-wide render is
+        // wider than 758, so it scales DOWN to fit (matches the mapping the
+        // input tests assume: disp 758×429, oy 297).
+        let geo = Geometry::for_panel(758, 1024, 480, 272, 2, "integer-fit");
+        assert_eq!((geo.disp_w, geo.disp_h), (758, 429));
+        assert_eq!(geo.oy, 297);
+    }
+
+    #[test]
+    fn landscape_is_detected_from_inkview_orientations() {
+        assert!(!is_landscape(ScreenOrientation::Portrait0Deg));
+        assert!(!is_landscape(ScreenOrientation::Portrait180Deg));
+        assert!(is_landscape(ScreenOrientation::Landscape90Deg));
+        assert!(is_landscape(ScreenOrientation::Landscape270Deg));
+    }
 }

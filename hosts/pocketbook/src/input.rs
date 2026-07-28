@@ -11,8 +11,17 @@ use pocketjs_core::spec::{btn, ANALOG_CENTER};
 pub enum Outcome {
     Continue,
     Quit,
-    /// A full redraw was requested (e.g. returning from background).
-    FullRedraw,
+    /// The app became visible (or the system asked for a repaint): re-assert
+    /// the foreground and do one clean full redraw. Fires on `Show`,
+    /// `Foreground`, and `Repaint` — inkview delivers resume-from-background
+    /// as `Foreground` (the slint backend maps it to WindowActiveChanged), not
+    /// reliably `Show`, so all three must trigger the clean repaint or the
+    /// e-ink panel stays frozen on the launcher's last image until input.
+    Show,
+    /// The app left the screen (`Hide` / `Background`): stop driving the panel
+    /// — the launcher owns it now, so blitting/partial-updating fights the
+    /// launcher and burns battery.
+    Hide,
 }
 
 pub struct Input {
@@ -46,7 +55,8 @@ impl Input {
     pub fn on_event(&mut self, ev: Event) -> Outcome {
         match ev {
             Event::Exit => Outcome::Quit,
-            Event::Show => Outcome::FullRedraw,
+            Event::Show | Event::Foreground { .. } | Event::Repaint => Outcome::Show,
+            Event::Hide | Event::Background { .. } => Outcome::Hide,
             Event::KeyDown { key } | Event::KeyRepeat { key } => {
                 self.buttons |= key_bit(key);
                 Outcome::Continue
@@ -128,6 +138,25 @@ mod tests {
         assert_eq!(input.snapshot().0 & btn::CROSS, btn::CROSS);
         input.apply_key_up(Key::Ok);
         assert_eq!(input.snapshot().0 & btn::CROSS, 0);
+    }
+
+    #[test]
+    fn lifecycle_events_map_to_visibility_outcomes() {
+        let mut input = Input::new(0, 0, 480, 320, 960, 640);
+        // Resume / repaint → a clean full redraw in the foreground.
+        assert!(matches!(input.on_event(Event::Show), Outcome::Show));
+        assert!(matches!(
+            input.on_event(Event::Foreground { pid: 1 }),
+            Outcome::Show
+        ));
+        assert!(matches!(input.on_event(Event::Repaint), Outcome::Show));
+        // Leaving the screen → stop driving the panel.
+        assert!(matches!(input.on_event(Event::Hide), Outcome::Hide));
+        assert!(matches!(
+            input.on_event(Event::Background { pid: 1 }),
+            Outcome::Hide
+        ));
+        assert!(matches!(input.on_event(Event::Exit), Outcome::Quit));
     }
 
     #[test]

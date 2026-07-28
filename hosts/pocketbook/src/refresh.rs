@@ -30,6 +30,11 @@ pub struct Refresh {
     /// partial update once things go quiet.
     pending_cleanup: Option<Rect>,
     cleanup_after: Option<Instant>,
+    /// Force the next incremental update to be a high-quality partial (not a
+    /// dynamic). Set on resume: after a background/foreground cycle the panel
+    /// ignores dynamic updates until a partial re-primes it (confirmed on the
+    /// Era Color — the spinner's dynamic updates stayed invisible until input).
+    force_partial: bool,
 }
 
 impl Refresh {
@@ -38,6 +43,7 @@ impl Refresh {
             last_draw: Instant::now(),
             pending_cleanup: None,
             cleanup_after: None,
+            force_partial: false,
         }
     }
 
@@ -61,6 +67,16 @@ impl Refresh {
         }
         let d = merge(dirty);
 
+        // Resume re-prime: the first incremental update after a
+        // background/foreground cycle must be a high-quality partial — a
+        // dynamic update here is silently dropped by the panel.
+        if self.force_partial {
+            self.force_partial = false;
+            screen.partial_update(d.x, d.y, d.w, d.h);
+            self.last_draw = Instant::now();
+            return;
+        }
+
         if screen.is_updating() {
             // A panel update is still in flight. Queue a fast dynamic update,
             // throttled to ≥20 ms, on the accumulated damage; schedule a
@@ -79,12 +95,26 @@ impl Refresh {
         }
     }
 
-    /// Full flashing redraw — call on Show / orientation change / mode switch.
+    /// Full flashing redraw — call on first paint / orientation change.
     pub fn full(&mut self, screen: &mut Screen) {
         screen.full_update();
         self.last_draw = Instant::now();
         self.pending_cleanup = None;
         self.cleanup_after = None;
+    }
+
+    /// Resume-from-background repaint: a high-quality partial over the whole
+    /// displayed region (NOT a flashing full_update), mirroring inkview-slint,
+    /// which never full-updates on foreground. The next incremental update is
+    /// forced partial too. `x,y,w,h` are the displayed region in screen
+    /// coordinates. (On the Era Color this does not yet fully re-prime the
+    /// panel — incremental updates still stall until input; see main.rs.)
+    pub fn resume(&mut self, screen: &mut Screen, x: i32, y: i32, w: u32, h: u32) {
+        screen.partial_update(x, y, w, h);
+        self.last_draw = Instant::now();
+        self.pending_cleanup = None;
+        self.cleanup_after = None;
+        self.force_partial = true;
     }
 }
 
